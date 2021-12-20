@@ -1,0 +1,675 @@
+---
+title: "Final Project"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(rpart)         # to train decision trees
+library(rpart.plot)    # to plot decision trees
+library(randomForest)  # random forests
+library(gbm)           # boosting
+library(tidyverse)     # tidyverse
+library(kableExtra)
+library(cowplot)
+library(ggplot2)
+library(class)
+library(pROC)
+library(glmnet)
+library(glmnetUtils)
+library(corrplot)
+```
+
+```{r}
+rawfa <- read_csv('Food Access Research Atlas.csv')
+rawtract <- read_csv('pdb2019bgv6_us.csv')
+```
+
+```{r,cache=T}
+modtract <- rawtract[is.na(rawtract$Flag),] # removes uninhabitable areas
+modtract1 <- modtract[!(is.na(modtract$Tot_Population_CEN_2010)|modtract$Tot_Population_CEN_2010==0),]
+# removes areas with no residents
+
+# Now, time to isolate the metrics that we actually care about
+modtract2 <- modtract1 %>%
+  select(GIDBG,Tract,Block_group,State_name,County_name,
+         Tot_Population_CEN_2010,
+         pct_URBAN_CLUSTER_POP_CEN_2010,
+         pct_URBANIZED_AREA_POP_CEN_2010,
+         pct_RURAL_POP_CEN_2010,
+         pct_Males_CEN_2010,
+         pct_Pop_under_5_CEN_2010,
+         pct_Pop_5_17_CEN_2010,
+         pct_Pop_18_24_CEN_2010,
+         pct_Pop_25_44_CEN_2010,
+         pct_Pop_45_64_CEN_2010,
+         pct_Pop_65plus_CEN_2010,
+         pct_Tot_GQ_CEN_2010,
+         pct_Hispanic_CEN_2010,
+         pct_NH_White_alone_CEN_2010,
+         pct_NH_Blk_alone_CEN_2010,
+         pct_NH_AIAN_alone_CEN_2010,
+         pct_NH_Asian_alone_CEN_2010,
+         pct_NH_NHOPI_alone_CEN_2010,
+         pct_Not_HS_Grad_ACS_13_17,
+         pct_College_ACS_13_17,
+         pct_Prs_Blw_Pov_Lev_ACS_13_17,
+         pct_No_Health_Ins_ACS_13_17,
+         pct_Diff_HU_1yr_Ago_ACS_13_17,
+         pct_Rel_Family_HHD_CEN_2010,
+         pct_MrdCple_HHD_CEN_2010,
+         pct_Female_No_HB_CEN_2010,
+         pct_Sngl_Prns_HHD_CEN_2010,
+         pct_HHD_PPL_Und_18_CEN_2010,
+         avg_Tot_Prns_in_HHD_CEN_2010,
+         pct_PUB_ASST_INC_ACS_13_17,
+         avg_Agg_HH_INC_ACS_13_17,
+         pct_Vacant_Units_CEN_2010,
+         pct_Renter_Occp_HU_CEN_2010,
+         pct_MLT_U2_9_STRC_ACS_13_17,
+         pct_MLT_U10p_ACS_13_17,
+         pct_Mobile_Homes_ACS_13_17,
+         pct_NO_PH_SRVC_ACS_13_17,
+         pct_No_Plumb_ACS_13_17,
+         pct_Recent_Built_HU_ACS_13_17,
+         avg_Agg_House_Value_ACS_13_17) %>%
+  rename_with(tolower)
+```
+
+```{r,cache=T}
+nrow(modtract2)-length(unique(modtract2$tract)) #There are 195505 repetitions of Tracts
+# This repetition is caused by the fact there are multiple "blocks" within each Tract
+# To be able to view the data at a Tract level (so we can combine with the Food Access data),
+  # we need to group by Tract and find the weighted avg of the blocks' data for some variables
+  # and the sum for others.
+
+# Upon further research, there are also multiple tracts with the same number across states.
+  # Thus, we will be using gidbg as an id for each census tract. This is more in line with
+  # the other data set as well.
+
+modtract3 <- modtract2 %>% separate(gidbg,into=c('gidbg','block'),sep=-1) %>% select(-block)
+
+fintract <- na.omit(modtract3) %>%
+  group_by(gidbg) %>%
+  mutate(total_pop=sum(tot_population_cen_2010)) %>%
+  mutate(pct_urban=weighted.mean(pct_urban_cluster_pop_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_urban_cluster_pop_cen_2010) %>%
+  mutate(pct_urbanized=weighted.mean(pct_urbanized_area_pop_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_urbanized_area_pop_cen_2010) %>%
+  mutate(pct_rural=weighted.mean(pct_rural_pop_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_rural_pop_cen_2010) %>%
+  mutate(pct_male=weighted.mean(pct_males_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_males_cen_2010) %>%
+  mutate(pct_under_5=weighted.mean(pct_pop_under_5_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_pop_under_5_cen_2010) %>%
+  mutate(pct_5_17=weighted.mean(pct_pop_5_17_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_pop_5_17_cen_2010) %>%
+  mutate(pct_18_24=weighted.mean(pct_pop_18_24_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_pop_18_24_cen_2010) %>%
+  mutate(pct_25_44=weighted.mean(pct_pop_25_44_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_pop_25_44_cen_2010) %>%
+  mutate(pct_45_64=weighted.mean(pct_pop_45_64_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_pop_45_64_cen_2010) %>%
+  mutate(pct_65plus=weighted.mean(pct_pop_65plus_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_pop_65plus_cen_2010) %>%
+  mutate(pct_group_quarters=weighted.mean(pct_tot_gq_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_tot_gq_cen_2010) %>%
+  mutate(pct_hispanic=weighted.mean(pct_hispanic_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_hispanic_cen_2010) %>%
+  mutate(pct_white=weighted.mean(pct_nh_white_alone_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_nh_white_alone_cen_2010) %>%
+  mutate(pct_black=weighted.mean(pct_nh_blk_alone_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_nh_blk_alone_cen_2010) %>%
+  mutate(pct_aian=weighted.mean(pct_nh_aian_alone_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_nh_aian_alone_cen_2010) %>%
+  mutate(pct_asian=weighted.mean(pct_nh_asian_alone_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_nh_asian_alone_cen_2010) %>%
+  mutate(pct_nhopi=weighted.mean(pct_nh_nhopi_alone_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_nh_nhopi_alone_cen_2010) %>%
+  mutate(pct_not_hs_grad=weighted.mean(pct_not_hs_grad_acs_13_17,tot_population_cen_2010)) %>%
+  select(-pct_not_hs_grad_acs_13_17) %>%
+  mutate(pct_college=weighted.mean(pct_college_acs_13_17,tot_population_cen_2010)) %>%
+  select(-pct_college_acs_13_17) %>%
+  mutate(pct_blw_pov=weighted.mean(pct_prs_blw_pov_lev_acs_13_17,tot_population_cen_2010)) %>%
+  select(-pct_prs_blw_pov_lev_acs_13_17) %>%
+  mutate(pct_no_h_ins=weighted.mean(pct_no_health_ins_acs_13_17,tot_population_cen_2010)) %>%
+  select(-pct_no_health_ins_acs_13_17) %>%
+  mutate(pct_moved=weighted.mean(pct_diff_hu_1yr_ago_acs_13_17,tot_population_cen_2010)) %>%
+  select(-pct_diff_hu_1yr_ago_acs_13_17) %>%
+  mutate(pct_family_hhd=weighted.mean(pct_rel_family_hhd_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_rel_family_hhd_cen_2010) %>%
+  mutate(pct_married_hhd=weighted.mean(pct_mrdcple_hhd_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_mrdcple_hhd_cen_2010) %>%
+  mutate(pct_single_female=weighted.mean(pct_female_no_hb_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_female_no_hb_cen_2010) %>%
+  mutate(pct_solo_res=weighted.mean(pct_sngl_prns_hhd_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_sngl_prns_hhd_cen_2010) %>%
+  mutate(pct_hhd_children=weighted.mean(pct_hhd_ppl_und_18_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_hhd_ppl_und_18_cen_2010) %>%
+  mutate(avg_ppl_hhd=weighted.mean(avg_tot_prns_in_hhd_cen_2010,tot_population_cen_2010)) %>%
+  select(-avg_tot_prns_in_hhd_cen_2010) %>%
+  mutate(pct_pub_assist=weighted.mean(pct_pub_asst_inc_acs_13_17,tot_population_cen_2010)) %>%
+  select(-pct_pub_asst_inc_acs_13_17) %>%
+  mutate(interim_income=as.numeric(gsub("[\\$,]", "", avg_agg_hh_inc_acs_13_17))) %>%
+  # ^ adjusting to be numeric
+  mutate(avg_hhd_income=weighted.mean(interim_income,tot_population_cen_2010)) %>%
+  select(-avg_agg_hh_inc_acs_13_17) %>%
+  select(-interim_income) %>%
+  mutate(pct_vacant_units=weighted.mean(pct_vacant_units_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_vacant_units_cen_2010) %>%
+  mutate(pct_vacant_units=weighted.mean(pct_renter_occp_hu_cen_2010,tot_population_cen_2010)) %>%
+  select(-pct_renter_occp_hu_cen_2010) %>%
+  mutate(pct_multi_2_9=weighted.mean(pct_mlt_u2_9_strc_acs_13_17,tot_population_cen_2010)) %>%
+  select(-pct_mlt_u2_9_strc_acs_13_17) %>%
+  mutate(pct_multi_10plus=weighted.mean(pct_mlt_u10p_acs_13_17,tot_population_cen_2010)) %>%
+  select(-pct_mlt_u10p_acs_13_17) %>%
+  mutate(pct_mobile_homes=weighted.mean(pct_mobile_homes_acs_13_17,tot_population_cen_2010)) %>%
+  select(-pct_mobile_homes_acs_13_17) %>%
+  mutate(pct_no_service=weighted.mean(pct_no_ph_srvc_acs_13_17,tot_population_cen_2010)) %>%
+  select(-pct_no_ph_srvc_acs_13_17) %>%
+  mutate(pct_no_plumbing=weighted.mean(pct_no_plumb_acs_13_17,tot_population_cen_2010)) %>%
+  select(-pct_no_plumb_acs_13_17) %>%
+  mutate(pct_new_house=weighted.mean(pct_recent_built_hu_acs_13_17,tot_population_cen_2010)) %>%
+  select(-pct_recent_built_hu_acs_13_17) %>%
+  mutate(interim_house_value=as.numeric(gsub("[\\$,]", "", avg_agg_house_value_acs_13_17))) %>%
+  # ^ adjusting to be numeric
+  mutate(avg_house_value=weighted.mean(interim_house_value,tot_population_cen_2010)) %>%
+  select(-avg_agg_house_value_acs_13_17) %>%
+  select(-interim_house_value) %>%
+  # now, to take out some columns we only still needed for computation
+  select(-c(tot_population_cen_2010,block_group,tract)) %>%
+  distinct(gidbg,total_pop,pct_urban,.keep_all=TRUE)
+```
+
+```{r,cache=T}
+rawfa1 <- rawfa %>% rename_with(tolower) %>%           # selecting only important variables 
+  select(censustract,state,county,la1and10,lahalfand10,       # (both explanatory and response)
+           la1and20,latracts_half,latracts1,latracts10,
+           latracts20,latractsvehicle_20,lapophalfshare,
+           lakidshalf,laseniorshalf,lahunvhalfshare,lapop1share,
+           lakids1,laseniors1,lahunv1share,lapop10share,lakids10,
+           laseniors10,lahunv10share,lapop20share,lakids20,
+           laseniors20,lahunv20share,tractkids,tractseniors,tractsnap,
+           pop2010)
+
+# the data only gave the # of kids/seniors with low access, as well as what percent of the
+# total population they comprise, but not what percent OF kids/seniors are low access
+
+finfa <- rawfa1 %>%
+  mutate(snap_share=tractsnap/pop2010*100) %>%              # calculating % on SNAP
+  select(-c(tractsnap,pop2010)) %>%
+  mutate(tot_share_half=as.numeric(lapophalfshare)) %>% # making columns not needing
+  select(-lapophalfshare) %>%                           # changing numeric
+  mutate(tot_share_1=as.numeric(lapop1share)) %>%       # also manages order
+  select(-lapop1share) %>%
+  mutate(tot_share_10=as.numeric(lapop10share)) %>%
+  select(-lapop10share) %>%
+  mutate(tot_share_20=as.numeric(lapop20share)) %>%
+  select(-lapop20share) %>%
+  mutate(no_vehic_half=as.numeric(lahunvhalfshare)) %>%
+  select(-lahunvhalfshare) %>%
+  mutate(no_vehic_1=as.numeric(lahunv1share)) %>%
+  select(-lahunv1share) %>%
+  mutate(no_vehic_10=as.numeric(lahunv10share)) %>%
+  select(-lahunv10share) %>%
+  mutate(no_vehic_20=as.numeric(lahunv20share)) %>%
+  select(-lahunv20share) %>%
+  mutate(kids_share_half=as.numeric(lakidshalf)/tractkids) %>%          #changes
+  select(-lakidshalf) %>%
+  mutate(seniors_share_half=as.numeric(laseniorshalf)/tractseniors) %>%
+  select(-laseniorshalf) %>%
+  mutate(kids_share_1=as.numeric(lakids1)/tractkids) %>%
+  select(-lakids1) %>%
+  mutate(seniors_share_1=as.numeric(laseniors1)/tractseniors) %>%
+  select(-laseniors1) %>%
+  mutate(kids_share_10=as.numeric(lakids10)/tractkids) %>%
+  select(-lakids10) %>%
+  mutate(seniors_share_10=as.numeric(laseniors10)/tractseniors) %>%
+  select(-laseniors10) %>%
+  mutate(kids_share_20=as.numeric(lakids20)/tractkids) %>%
+  select(-lakids20) %>%
+  mutate(seniors_share_20=as.numeric(laseniors20)/tractseniors) %>%
+  select(-laseniors20) %>%
+  select(-c(tractkids,tractseniors,state,county))
+```
+```{r,cache=T}
+finfa$censustract <- as.numeric(finfa$censustract)
+fintract$gidbg <- as.numeric(fintract$gidbg)
+finfa <- finfa %>% rename(tract=censustract)
+fintract <- fintract %>% rename(tract=gidbg)
+
+us_food_access <- inner_join(fintract,finfa,by='tract')
+us_food_access <- us_food_access[!(us_food_access$tract==46102940900 |
+                   us_food_access$tract==2158000100 |
+                   us_food_access$tract==46102940500),]
+```
+
+
+# Analysis
+
+
+```{r,cache=T}
+set.seed(250)
+train_samples <- sample(1:nrow(us_food_access),0.8*nrow(us_food_access))
+food_train <- us_food_access[train_samples,]
+food_test <- us_food_access[-train_samples,]
+
+glm_fit_10 <- glm(latracts10 ~ 
+                   pct_urban+pct_urbanized+pct_rural+
+                   pct_male+pct_under_5+
+                   pct_5_17+pct_18_24+
+                   pct_25_44+pct_45_64+
+                   pct_65plus+pct_group_quarters+
+                   pct_hispanic+pct_white+
+                   pct_black+pct_aian+
+                   pct_asian+pct_nhopi+
+                   pct_not_hs_grad+pct_college+
+                   pct_blw_pov+pct_no_h_ins+
+                   pct_moved+pct_family_hhd+
+                   pct_single_female+
+                   pct_solo_res+pct_hhd_children+
+                   avg_ppl_hhd+pct_pub_assist+
+                   avg_hhd_income+
+                   pct_vacant_units+
+                   pct_multi_2_9+
+                   pct_multi_10plus+
+                   pct_mobile_homes+
+                   pct_no_service+
+                   pct_no_plumbing+pct_new_house+
+                   avg_house_value+snap_share,
+                   family='binomial',
+                 data=food_train)
+summary(glm_fit_10)
+```
+
+```{r,cache=T}
+fitted_probabilities <- predict(glm_fit_10,
+        newdata=food_test,type="response")
+hist(fitted_probabilities)
+```
+```{r,cache=T}
+predictions <- fitted_probabilities>0.5
+food_test <- food_test %>%
+  ungroup() %>%
+  mutate(predicted_flag=predictions)
+# misclassification rate
+food_test %>% summarise(mean(latracts10!=predicted_flag))
+```
+
+```{r,cache=T}
+food_test %>%
+  select(latracts10,predicted_flag) %>%
+  table()
+```
+
+```{r,cache=T}
+C_FN<- 53000000000/nrow(us_food_access)+1000000 # total cost of food inequity / # of tracts
+C_FP <- 500000 # cost of building supermarket
+thresh <- C_FP/(C_FP+C_FN)
+thresh
+predictions <- as.numeric(fitted_probabilities>thresh)
+food_test %>%
+  mutate(predicted_flag=predictions) %>%
+  select(latracts10,predicted_flag) %>%
+  table()
+```
+
+```{r,cache=T}
+# ROC curve
+roc_log <- roc(food_test %>% pull(latracts10),
+               fitted_probabilities)
+
+fpr <- 1-roc_log$specificities
+tpr <- roc_log$sensitivities
+tibble(fpr,tpr) %>%
+  ggplot(aes(x=fpr,y=tpr)) +
+  geom_line() +
+  geom_abline(slope=1,linetype='dashed') +
+  theme_bw()
+```
+```{r,cache=T}
+roc_log$auc
+```
+
+```{r,cache=T}
+food_train %>%
+  ggplot(aes(x=pct_college,y=latracts10)) +
+  geom_jitter(height=0.05) +
+  geom_smooth(method='glm',
+              formula='y~x',
+              method.args=list(family='binomial'),
+              se=F) +
+  ylab("Prob(flagged for having low food access") +
+  geom_hline(yintercept=thresh,linetype='dashed',color='red')
+  theme_bw()
+```
+
+```{r,cache=T}
+train1 <- food_train %>% ungroup() %>% select(pct_urban,
+                   pct_urbanized,pct_rural,
+                   pct_male,pct_under_5,
+                   pct_5_17,pct_18_24,
+                   pct_25_44,pct_45_64,
+                   pct_65plus,pct_group_quarters,
+                   pct_hispanic,pct_white,
+                   pct_black,pct_aian,
+                   pct_asian,pct_nhopi,
+                   pct_not_hs_grad,pct_college,
+                   pct_blw_pov,pct_no_h_ins,
+                   pct_moved,pct_family_hhd,
+                   pct_single_female,
+                   pct_solo_res,pct_hhd_children,
+                   avg_ppl_hhd,pct_pub_assist,
+                   avg_hhd_income,
+                   pct_vacant_units,
+                   pct_multi_2_9,
+                   pct_multi_10plus,
+                   pct_mobile_homes,
+                   pct_no_service,
+                   pct_no_plumbing,pct_new_house,
+                   avg_house_value,snap_share) 
+test1 <- food_test %>% select(pct_urban,
+                   pct_urbanized,pct_rural,
+                   pct_male,pct_under_5,
+                   pct_5_17,pct_18_24,
+                   pct_25_44,pct_45_64,
+                   pct_65plus,pct_group_quarters,
+                   pct_hispanic,pct_white,
+                   pct_black,pct_aian,
+                   pct_asian,pct_nhopi,
+                   pct_not_hs_grad,pct_college,
+                   pct_blw_pov,pct_no_h_ins,
+                   pct_moved,pct_family_hhd,
+                   pct_single_female,
+                   pct_solo_res,pct_hhd_children,
+                   avg_ppl_hhd,pct_pub_assist,
+                   avg_hhd_income,
+                   pct_vacant_units,
+                   pct_multi_2_9,
+                   pct_multi_10plus,
+                   pct_mobile_homes,
+                   pct_no_service,
+                   pct_no_plumbing,pct_new_house,
+                   avg_house_value,snap_share)
+
+knn_results <- knn(
+  train=train1,
+  test= test1,
+  cl = food_train$latracts10,
+  k=10,
+  prob=TRUE
+)
+
+# adding results to test tibble
+food_test <- food_test %>%
+  ungroup() %>%
+  mutate(prediction=as.numeric(knn_results == 1),
+         probability = attributes(knn_results)$prob,
+         probability = ifelse(prediction==1, probability, 1-probability))
+  
+#plotting the results
+food_test %>%
+  ggplot(aes(x=pct_college)) +
+  geom_jitter(aes(y = latracts10, colour = as.factor(prediction)),
+              width = 0, height = 0.1) +
+  geom_smooth(aes(y = probability)) +
+  scale_y_continuous(breaks = c(0,1)) +
+  theme_bw()
+```
+
+```{r,cache=T}
+# performance metrics of knn
+conf_matrix_knn <- food_test %>%
+  select(latracts10,prediction) %>%
+  table()
+conf_matrix_knn
+# not possible to find false positive/false negative rate because there are no
+# predicted flags in this model
+```
+
+```{r,cache=T}
+food_test %>%
+  summarise(weighted_error = mean(C_FP*(prediction == 1 & latracts10 == 0) +
+                                  C_FN*(prediction == 0 & latracts10 == 1)))
+# this all comes from the cost of incorrectly predicting a tract should not
+# be flagged
+```
+
+```{r,cache=T}
+# ROC curve
+
+roc_knn <- roc(food_test %>% pull(latracts10),
+                food_test %>% pull(probability))
+tibble(FPR_knn = 1-roc_knn$specificities,
+       TPR_knn = roc_knn$sensitivities) %>%
+  ggplot(aes(x=FPR_knn,y=TPR_knn)) +
+  geom_line() +
+  geom_abline(slope = 1, linetype = "dashed") +
+  xlim(0,1)+
+  geom_point(x=0,y=roc_knn$sensitivities[length(roc_knn)], # FPR = 0
+             color='red') +
+  theme_bw()
+```
+```{r,cache=T}
+roc_knn$auc
+```
+
+```{r,cache=T}
+num_thresholds = 100
+thresholds = seq(0,1,length.out=num_thresholds) 
+weighted_errors = numeric(num_thresholds)
+for(threshold_idx in 1:num_thresholds){
+  threshold = thresholds[threshold_idx]
+  weighted_errors[threshold_idx] =
+    food_test %>%
+    mutate(prediction = probability >= threshold) %>%
+    summarise(weighted_error = mean(C_FP*(prediction == 1&latracts10==0) +
+                                      C_FN*(prediction==0 &latracts10==1))) %>%
+    pull()
+}
+
+tibble(threshold = thresholds, weighted_error = weighted_errors) %>%
+  ggplot(aes(x = threshold, y = weighted_error)) +
+  geom_line() +
+  geom_vline(xintercept = c(C_FP/(C_FP + C_FN), 0.5),
+             linetype = "dashed", colour = "red") +
+  labs(x = "KNN probability threshold", y = "Average cost per transaction") +
+  theme_bw()
+```
+
+```{r,cache=T}
+food_test_weighted <- food_test %>%
+  mutate(prediction = probability >= C_FP/(C_FP + C_FN))
+food_test_weighted %>%
+  ggplot(aes(x = pct_college)) +
+  geom_jitter(aes(y = latracts10, colour = prediction), width = 0, height = 0.1) +
+  geom_smooth(aes(y = probability)) +
+  geom_hline(yintercept = c(0.5, C_FP/(C_FP + C_FN)),
+           linetype = "dashed", colour = "red") +
+  scale_y_continuous(breaks = c(0,1)) +
+  theme_bw()
+```
+
+```{r,cache=T}
+tibble(
+  TP=sum(as.numeric(food_test_weighted$prediction)==1&food_test_weighted$latracts10==1),
+  FP=sum(as.numeric(food_test_weighted$prediction)==1&food_test_weighted$latracts10==0),
+  FN=sum(as.numeric(food_test_weighted$prediction)==0&food_test_weighted$latracts10==1),
+  TN=sum(as.numeric(food_test_weighted$prediction)==0&food_test_weighted$latracts10==0))
+```
+
+## Ridge and Lasso Regressions
+
+
+
+```{r,cache=T}
+source('/Users/shyankoul/Documents/Stat-471/stat-471-fall-2021/functions/plot_glmnet.R')
+source('/Users/shyankoul/Documents/Stat-471/stat-471-fall-2021/functions/cross_validate_spline.R')
+
+train2 <- train1 %>% ungroup() %>%
+  mutate(latracts10=food_train$latracts10)
+ridge_fit <- cv.glmnet(latracts10 ~ .,
+                       alpha=0,
+                       nfolds=10,
+                       family='binomial',
+                       type.measure='class',
+                       data=train2)
+plot(ridge_fit)
+```
+
+```{r,cache=T}
+plot_glmnet(ridge_fit,train2,features_to_plot=10)
+```
+
+```{r,cache=T}
+probabilities <- predict(ridge_fit,
+                         newdata=test1,
+                         s='lambda.1se',
+                         type='class') %>%
+  as.numeric()
+table(food_test$latracts10,probabilities)
+```
+
+```{r,cache=T}
+lasso_fit <- cv.glmnet(latracts10 ~ .,
+                       alpha=1,
+                       nfolds=10,
+                       family='binomial',
+                       type.measure='class',
+                       data=train2)
+plot(lasso_fit)
+```
+```{r,cache=T}
+plot_glmnet(lasso_fit,train2,features_to_plot=10)
+```
+
+```{r,cache=T}
+prob_lasso <- predict(lasso_fit,
+                      newdata=test1,
+                      s='lambda.1se',
+                      type='class') %>%
+  as.numeric()
+table(food_test$latracts10,prob_lasso)
+```
+
+
+
+
+# Decision Tree Models
+
+```{r,cache=TRUE}
+rf_fit3 <- randomForest(as.factor(as.character(latracts10)) ~ .,
+                        mtry=3,
+                       data=train2)
+rf_fit9 <- randomForest(as.factor(as.character(latracts10)) ~ .,
+                        mtry=9,
+                       data=train2)
+rf_fit19 <- randomForest(as.factor(as.character(latracts10)) ~ .,
+                        mtry=19,
+                       data=train2)
+rf_fit38 <- randomForest(as.factor(as.character(latracts10)) ~ .,
+                        mtry=38,
+                       data=train2)
+```
+
+```{r,cache=T}
+oob_errors = bind_rows(
+  tibble(ntree = 1:500, oob_err = rf_fit3$err.rate[,1], m = 3),
+  tibble(ntree = 1:500, oob_err = rf_fit9$err.rate[,1], m = 9),
+  tibble(ntree = 1:500, oob_err = rf_fit19$err.rate[,1], m = 19),
+  tibble(ntree = 1:500, oob_err = rf_fit38$err.rate[,1], m = 38)
+)
+oob_errors
+```
+
+```{r,cache=T}
+ oob_errors %>%
+  ggplot(aes(x = ntree, y = oob_err, colour = factor(m))) +
+  geom_line() + theme_bw()
+```
+
+
+```{r,cache=T}
+head(rf_fit9$importance,5)
+```
+
+```{r,cache=T}
+varImpPlot(rf_fit9)
+```
+
+```{r,cache=T}
+rf_predictions <- as.numeric(as.character(predict(rf_fit9,newdata=food_test)))
+mean((rf_predictions-food_test$latracts10)^2)
+```
+
+```{r,cache=T}
+gbm_fit1 = gbm(latracts10 ~ .,
+              distribution = "bernoulli",
+              n.trees = 300,
+              interaction.depth = 1,
+              shrinkage = 0.1,
+              cv.folds = 5,
+              data = train2)
+gbm_fit2 = gbm(latracts10 ~ .,
+              distribution = "bernoulli",
+              n.trees = 300,
+              interaction.depth = 2,
+              shrinkage = 0.1,
+              cv.folds = 5,
+              data = train2)
+gbm_fit3 = gbm(latracts10 ~ .,
+              distribution = "bernoulli",
+              n.trees = 300,
+              interaction.depth = 3,
+              shrinkage = 0.1,
+              cv.folds = 5,
+              data = train2)
+
+gbm_fit5 = gbm(latracts10 ~ .,
+              distribution = "bernoulli",
+              n.trees = 300,
+              interaction.depth = 5,
+              shrinkage = 0.1,
+              cv.folds = 5,
+              data = train2)
+
+ntrees <- 300
+cv_errors_boost <- bind_rows(
+  tibble(ntree = 1:ntrees, cv_err = gbm_fit1$cv.error, depth = 1),
+  tibble(ntree = 1:ntrees, cv_err = gbm_fit2$cv.error, depth = 2),
+  tibble(ntree = 1:ntrees, cv_err = gbm_fit3$cv.error, depth = 3),
+  tibble(ntree = 1:ntrees, cv_err = gbm_fit5$cv.error, depth = 5))
+
+cv_errors_boost %>%
+  ggplot(aes(x = ntree, y = cv_err, colour = factor(depth))) +
+  geom_line() + theme_bw()
+```
+
+```{r,cache=T}
+optimal_num_trees = gbm.perf(gbm_fit5, plot.it = FALSE)
+summary(gbm_fit3,n.trees=optimal_num_trees,plotit=FALSE)
+```
+
+```{r,cache=T}
+plot(gbm_fit5, i.var = "pct_rural", n.trees = optimal_num_trees, type = "response")
+```
+
+```{r,cache=T}
+plot(gbm_fit3, i.var = "pct_no_plumbing", n.trees = optimal_num_trees, type = "response")
+```
+
+```{r,cache=T}
+corrplot.mixed(cor(train1),
+               lower = "number", 
+               upper = "circle",
+               tl.col = "black")
+```
+
+
+
+
